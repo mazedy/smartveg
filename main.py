@@ -13,6 +13,9 @@ from transformers import pipeline
 from PIL import Image
 import io
 import uvicorn
+import gc
+import os
+import requests
 from pathlib import Path
 
 # Initialize FastAPI app
@@ -31,9 +34,10 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Global variables for the models
+# Global variables for the models (lazy-loaded)
 classifier = None
-zeroshot = None
+zeroshot = None  # Intentionally disabled to save memory on 512MB
+ZEROSHOT_API_URL = os.getenv("ZEROSHOT_API_URL", "").strip()
 
 # Supported vegetable labels (extendable)
 VEGETABLE_LABELS = [
@@ -130,20 +134,9 @@ VEGETABLE_DETAILS = {
 
 @app.on_event("startup")
 async def load_model():
-    """Load the pre-trained models on startup"""
-    global classifier, zeroshot
-    print("🔄 Loading pre-trained models...")
-    print("⏳ This may take 1-2 minutes on first run (downloading models)...")
-
-    # Lightweight general classifier (MobileNet)
-    classifier = pipeline("image-classification", model="google/mobilenet_v2_1.0_224")
-
-    # Zero-shot image classifier (CLIP) for custom labels like vegetable names and freshness
-    zeroshot = pipeline("zero-shot-image-classification", model="openai/clip-vit-base-patch32")
-
-    print("✅ Models loaded successfully!")
-    print("🚀 API is ready to classify and analyze images!")
-
+    """Startup hook; models are lazy-loaded to reduce memory footprint on 512MB."""
+    print("🔄 Starting API (lazy-loading models on first request)...")
+    # Do not load any models here to save memory during cold start
 
 @app.get("/")
 @app.head("/")
@@ -156,7 +149,7 @@ async def root():
         # Fallback to API info if HTML not found
         return {
             "message": "Image Classification API",
-            "model": "google/mobilenet_v2_1.0_224 + openai/clip-vit-base-patch32",
+            "model": "google/mobilenet_v2_1.0_224",
             "status": "running",
             "endpoints": {
                 "/classify": "POST - Upload an image to classify",
@@ -187,9 +180,18 @@ async def health_check():
     return {
         "status": "healthy",
         "classifier_loaded": classifier is not None,
-        "zeroshot_loaded": zeroshot is not None,
+        "zeroshot_loaded": False,
         "vegetable_labels": VEGETABLE_LABELS,
     }
+
+
+def _resize_image(image: Image.Image, max_side: int = 512) -> Image.Image:
+    """Resize image in-place to keep max dimension under max_side to save RAM."""
+    try:
+        image.thumbnail((max_side, max_side))
+    except Exception:
+        pass
+    return image
 
 
 @app.post("/classify")
@@ -204,9 +206,10 @@ async def classify_image(file: UploadFile = File(...)):
         JSON with top predictions and confidence scores
     """
     
-    # Check if model is loaded
+    # Lazy-load MobileNetV2
+    global classifier
     if classifier is None:
-        raise HTTPException(status_code=503, detail="Model not loaded yet. Please wait...")
+        classifier = pipeline("image-classification", model="google/mobilenet_v2_1.0_224")
     
     # Validate file type
     if not file.content_type.startswith("image/"):
@@ -220,12 +223,15 @@ async def classify_image(file: UploadFile = File(...)):
         # Convert to RGB if necessary (handles PNG with alpha channel, etc.)
         if image.mode != "RGB":
             image = image.convert("RGB")
+
+        # Resize to reduce memory footprint
+        image = _resize_image(image, max_side=512)
         
         # Classify the image (returns top 5 predictions by default)
         predictions = classifier(image)
         
         # Format response
-        return {
+        response = {
             "success": True,
             "filename": file.filename,
             "predictions": [
@@ -241,6 +247,12 @@ async def classify_image(file: UploadFile = File(...)):
                 "confidence": round(predictions[0]["score"] * 100, 2)
             }
         }
+
+        # Free memory
+        del image, image_bytes, predictions
+        gc.collect()
+
+        return response
     
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error processing image: {str(e)}")
@@ -297,6 +309,87 @@ def _analyze_image(image: Image.Image):
     }
 
 
+def _run_zeroshot_local(image: Image.Image):
+    """Lazily run zero-shot classification locally without persisting the model in memory.
+    This loads the CLIP pipeline on-demand, performs predictions, and frees it immediately to save RAM.
+    """
+    from transformers import pipeline as hf_pipeline
+
+    # Resize to keep memory lower for local ZS
+    if image.mode != "RGB":
+        image = image.convert("RGB")
+    try:
+        image.thumbnail((384, 384))
+    except Exception:
+        pass
+
+    zs = None
+    try:
+        zs = hf_pipeline("zero-shot-image-classification", model="openai/clip-vit-base-patch32")
+
+        veg_preds = zs(
+            image,
+            candidate_labels=VEGETABLE_LABELS,
+            hypothesis_template="This is a photo of a {}.",
+            multi_label=False,
+        )
+
+        freshness_labels = ["fresh", "slightly wilted", "spoiled", "overripe", "damaged", "non-fresh"]
+        fresh_preds = zs(
+            image,
+            candidate_labels=freshness_labels,
+            hypothesis_template="The vegetable is {}.",
+            multi_label=False,
+        )
+
+        def _fmt(preds):
+            return [
+                {
+                    "label": p["label"],
+                    "confidence": round(p["score"] * 100, 2),
+                    "score": round(p["score"], 4),
+                }
+                for p in preds
+            ]
+
+        veg_top = veg_preds[0]["label"] if isinstance(veg_preds, list) and veg_preds else None
+        fresh_top = fresh_preds[0]["label"] if isinstance(fresh_preds, list) and fresh_preds else None
+        details = VEGETABLE_DETAILS.get(veg_top.lower(), None) if veg_top else None
+
+        return {
+            "vegetable": {"top": veg_top, "predictions": _fmt(veg_preds)},
+            "freshness": {"top": fresh_top, "predictions": _fmt(fresh_preds)},
+            "details": details,
+        }
+    finally:
+        # Free model and memory
+        del zs
+        gc.collect()
+
+
+def _forward_zeroshot_to_api(file_bytes: bytes, filename: str):
+    """Forward zero-shot request to external API if configured.
+    Expects external API to accept multipart form field 'file' and return a JSON
+    compatible with our /analyze response or close enough to map.
+    """
+    if not ZEROSHOT_API_URL:
+        raise HTTPException(status_code=503, detail="Zero-shot analysis disabled on free tier.")
+    try:
+        resp = requests.post(
+            ZEROSHOT_API_URL,
+            files={"file": (filename or "image.jpg", file_bytes, "application/octet-stream")},
+            timeout=30,
+        )
+        if resp.status_code != 200:
+            raise HTTPException(status_code=resp.status_code, detail=f"Upstream zero-shot API error: {resp.text[:200]}")
+        data = resp.json()
+        return data
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Failed forwarding to zero-shot API: {str(e)}")
+
+
 @app.post("/analyze")
 async def analyze_image(file: UploadFile = File(...)):
     """
@@ -304,7 +397,33 @@ async def analyze_image(file: UploadFile = File(...)):
     Returns top predictions and details for the recognized vegetable.
     """
     if zeroshot is None:
-        raise HTTPException(status_code=503, detail="Model not loaded yet. Please wait...")
+        # Offload to external API if configured; otherwise run a local one-shot CLIP and free it
+        file_bytes = await file.read()
+        if ZEROSHOT_API_URL:
+            data = _forward_zeroshot_to_api(file_bytes, file.filename)
+            veg_preds = (data.get("vegetable", {}) or {}).get("predictions", [])
+            fresh_preds = (data.get("freshness", {}) or {}).get("predictions", [])
+        else:
+            image = Image.open(io.BytesIO(file_bytes))
+            data = _run_zeroshot_local(image)
+            veg_preds = data.get("vegetable", {}).get("predictions", [])
+            fresh_preds = data.get("freshness", {}).get("predictions", [])
+
+        def _top_and_alt(preds):
+            top = preds[0] if preds else {"label": None, "confidence": 0}
+            alts = preds[1:4] if len(preds) > 1 else []
+            return top, alts
+        vtop, valt = _top_and_alt(veg_preds)
+        ftop, falt = _top_and_alt(fresh_preds)
+        data["summary"] = {
+            "top_object": vtop.get("label"),
+            "top_object_confidence": vtop.get("confidence"),
+            "top_freshness": ftop.get("label"),
+            "top_freshness_confidence": ftop.get("confidence"),
+            "other_objects": [{"label": p.get("label"), "confidence": p.get("confidence")} for p in valt],
+            "other_freshness": [{"label": p.get("label"), "confidence": p.get("confidence")} for p in falt],
+        }
+        return data
 
     if not file.content_type.startswith("image/"):
         raise HTTPException(status_code=400, detail="File must be an image")
@@ -315,10 +434,28 @@ async def analyze_image(file: UploadFile = File(...)):
 
         analysis = _analyze_image(image)
 
+        # Build structured summary
+        veg_preds = analysis.get("vegetable", {}).get("predictions", [])
+        fresh_preds = analysis.get("freshness", {}).get("predictions", [])
+        def _top_and_alt(preds):
+            top = preds[0] if preds else {"label": None, "confidence": 0}
+            alts = preds[1:4] if len(preds) > 1 else []
+            return top, alts
+        vtop, valt = _top_and_alt(veg_preds)
+        ftop, falt = _top_and_alt(fresh_preds)
+
         return {
             "success": True,
             "filename": file.filename,
             **analysis,
+            "summary": {
+                "top_object": vtop.get("label"),
+                "top_object_confidence": vtop.get("confidence"),
+                "top_freshness": ftop.get("label"),
+                "top_freshness_confidence": ftop.get("confidence"),
+                "other_objects": [{"label": p.get("label"), "confidence": p.get("confidence")} for p in valt],
+                "other_freshness": [{"label": p.get("label"), "confidence": p.get("confidence")} for p in falt],
+            },
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error processing image: {str(e)}")
@@ -331,7 +468,37 @@ async def analyze_image_top_only(file: UploadFile = File(...)):
     Useful for real-time webcam polling.
     """
     if zeroshot is None:
-        raise HTTPException(status_code=503, detail="Model not loaded yet. Please wait...")
+        # Offload if configured, else run local one-shot and free
+        file_bytes = await file.read()
+        if ZEROSHOT_API_URL:
+            data = _forward_zeroshot_to_api(file_bytes, file.filename)
+        else:
+            image = Image.open(io.BytesIO(file_bytes))
+            data = _run_zeroshot_local(image)
+
+        veg = None
+        fresh = None
+        try:
+            veg = data.get("vegetable", {}).get("top")
+            if not veg and data.get("vegetable"):
+                preds = data["vegetable"].get("predictions", [])
+                veg = preds[0]["label"] if preds else None
+        except Exception:
+            pass
+        try:
+            fresh = data.get("freshness", {}).get("top")
+            if not fresh and data.get("freshness"):
+                fpreds = data["freshness"].get("predictions", [])
+                fresh = fpreds[0]["label"] if fpreds else None
+        except Exception:
+            pass
+        return {
+            "success": True,
+            "filename": file.filename,
+            "vegetable": veg,
+            "freshness": fresh,
+            "details": data.get("details"),
+        }
 
     if not file.content_type.startswith("image/"):
         raise HTTPException(status_code=400, detail="File must be an image")
@@ -365,8 +532,10 @@ async def classify_image_top_only(file: UploadFile = File(...)):
         JSON with only the top prediction
     """
     
+    # Lazy-load MobileNetV2
+    global classifier
     if classifier is None:
-        raise HTTPException(status_code=503, detail="Model not loaded yet. Please wait...")
+        classifier = pipeline("image-classification", model="google/mobilenet_v2_1.0_224")
     
     if not file.content_type.startswith("image/"):
         raise HTTPException(status_code=400, detail="File must be an image")
@@ -378,15 +547,24 @@ async def classify_image_top_only(file: UploadFile = File(...)):
         if image.mode != "RGB":
             image = image.convert("RGB")
         
+        # Resize to reduce memory footprint
+        image = _resize_image(image, max_side=512)
+
         predictions = classifier(image, top_k=1)  # Get only top prediction
         
-        return {
+        response = {
             "success": True,
             "filename": file.filename,
             "label": predictions[0]["label"],
             "confidence": round(predictions[0]["score"] * 100, 2),
             "score": round(predictions[0]["score"], 4)
         }
+
+        # Free memory
+        del image, image_bytes, predictions
+        gc.collect()
+
+        return response
     
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error processing image: {str(e)}")
