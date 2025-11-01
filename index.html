@@ -336,24 +336,11 @@
             </button>
         </div>
 
-        <div class="results" id="realtime" style="margin-top:16px; display:none;">
-            <div class="results-header">
-                <span>🎥</span>
-                <span>Real-time Webcam</span>
-            </div>
-            <div style="display:flex; gap:12px; align-items:center; margin-bottom:12px;">
-                <button class="btn-reset" id="btnStart" style="width:auto; padding:10px 14px;">Enable Webcam</button>
-                <button class="btn-reset" id="btnStop" style="width:auto; padding:10px 14px; background:#ef4444;">Stop</button>
-                <div id="rtStatus" style="color:#374151; font-weight:600;"></div>
-            </div>
-            <video id="video" autoplay playsinline style="width:100%; max-height:320px; border-radius:10px; background:#000;"></video>
-        </div>
-
         <div class="footer">
-            Powered by
-            <a href="https://huggingface.co/google/mobilenet_v2_1.0_224" target="_blank">MobileNetV2</a>
-            and
-            <a href="https://huggingface.co/openai/clip-vit-base-patch32" target="_blank">CLIP</a>
+        
+            <a href="https://huggingface.co/google/mobilenet_v2_1.0_224" target="_blank"></a>
+            
+            <a href="https://huggingface.co/openai/clip-vit-base-patch32" target="_blank"></a>
         </div>
     </div>
 
@@ -369,13 +356,6 @@
         const freshnessTop = document.getElementById('freshnessTop');
         const errorDiv = document.getElementById('error');
         const freshPredictions = document.getElementById('freshPredictions');
-        const realtime = document.getElementById('realtime');
-        const video = document.getElementById('video');
-        const btnStart = document.getElementById('btnStart');
-        const btnStop = document.getElementById('btnStop');
-        const rtStatus = document.getElementById('rtStatus');
-        let mediaStream = null;
-        let pollTimer = null;
 
         // Click to upload
         uploadArea.addEventListener('click', () => fileInput.click());
@@ -563,65 +543,6 @@
             results.classList.remove('active');
             errorDiv.classList.remove('active');
             uploadArea.style.display = 'block';
-        }
-
-        realtime.style.display = 'block';
-
-        btnStart.addEventListener('click', async () => {
-            try {
-                if (!mediaStream) {
-                    mediaStream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'environment' } });
-                    video.srcObject = mediaStream;
-                }
-                if (pollTimer) clearInterval(pollTimer);
-                pollTimer = setInterval(captureAndAnalyze, 1000);
-                rtStatus.textContent = 'Running';
-            } catch (e) {
-                rtStatus.textContent = 'Webcam not available';
-            }
-        });
-
-        btnStop.addEventListener('click', () => {
-            if (pollTimer) {
-                clearInterval(pollTimer);
-                pollTimer = null;
-            }
-            if (mediaStream) {
-                mediaStream.getTracks().forEach(t => t.stop());
-                mediaStream = null;
-                video.srcObject = null;
-            }
-            rtStatus.textContent = 'Stopped';
-        });
-
-        async function captureAndAnalyze() {
-            if (!video.videoWidth) return;
-            const canvas = document.createElement('canvas');
-            canvas.width = video.videoWidth;
-            canvas.height = video.videoHeight;
-            const ctx = canvas.getContext('2d');
-            ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
-            const blob = await new Promise(r => canvas.toBlob(r, 'image/jpeg', 0.7));
-            const formData = new FormData();
-            formData.append('file', blob, 'frame.jpg');
-            try {
-                const res = await fetch('/analyze-top', { method: 'POST', body: formData });
-                if (!res.ok) return;
-                const data = await res.json();
-                const veg = data.vegetable || 'Unknown';
-                const fresh = data.freshness || 'Unknown';
-                topPrediction.innerHTML = `
-                    <div class="medal">🥇</div>
-                    <div class="label">${veg}</div>
-                    <div class="confidence"></div>
-                `;
-                freshnessTop.innerHTML = `
-                    <div class="medal">🧪</div>
-                    <div class="label">${fresh}</div>
-                    <div class="confidence"></div>
-                `;
-                results.classList.add('active');
-            } catch {}
         }
     </script>
 </body>
