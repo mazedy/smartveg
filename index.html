@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>AI Image Classifier</title>
+    <title>Vegetable Freshness Analyzer</title>
     <style>
         * {
             margin: 0;
@@ -291,9 +291,9 @@
 <body>
     <div class="container">
         <div class="header">
-            <div class="emoji">🤖</div>
-            <h1>AI Image Classifier</h1>
-            <p>Upload an image to identify what's in it</p>
+            <div class="emoji">🥦</div>
+            <h1>Vegetable Freshness Analyzer</h1>
+            <p>Upload a vegetable image to detect type and freshness/damage</p>
         </div>
 
         <div class="upload-area" id="uploadArea">
@@ -307,7 +307,7 @@
 
         <div class="loading" id="loading">
             <div class="spinner"></div>
-            <div class="loading-text">Analyzing image...</div>
+            <div class="loading-text">Analyzing vegetable...</div>
         </div>
 
         <div class="preview-container" id="previewContainer">
@@ -316,20 +316,44 @@
 
         <div class="results" id="results">
             <div class="top-prediction" id="topPrediction"></div>
+
+            <div class="top-prediction" id="freshnessTop" style="background: linear-gradient(135deg, #34d399 0%, #059669 100%); margin-top: 12px;"></div>
             
             <div class="results-header">
                 <span>📊</span>
-                <span>All Predictions</span>
+                <span>Predictions</span>
             </div>
             <div id="predictions"></div>
+
+            <div class="results-header" style="margin-top:16px;">
+                <span>🧪</span>
+                <span>Freshness Predictions</span>
+            </div>
+            <div id="freshPredictions"></div>
 
             <button class="btn-reset" onclick="reset()">
                 🔄 Classify Another Image
             </button>
         </div>
 
+        <div class="results" id="realtime" style="margin-top:16px; display:none;">
+            <div class="results-header">
+                <span>🎥</span>
+                <span>Real-time Webcam</span>
+            </div>
+            <div style="display:flex; gap:12px; align-items:center; margin-bottom:12px;">
+                <button class="btn-reset" id="btnStart" style="width:auto; padding:10px 14px;">Enable Webcam</button>
+                <button class="btn-reset" id="btnStop" style="width:auto; padding:10px 14px; background:#ef4444;">Stop</button>
+                <div id="rtStatus" style="color:#374151; font-weight:600;"></div>
+            </div>
+            <video id="video" autoplay playsinline style="width:100%; max-height:320px; border-radius:10px; background:#000;"></video>
+        </div>
+
         <div class="footer">
-            Powered by <a href="https://huggingface.co/google/mobilenet_v2_1.0_224" target="_blank">Google MobileNetV2</a>
+            Powered by
+            <a href="https://huggingface.co/google/mobilenet_v2_1.0_224" target="_blank">MobileNetV2</a>
+            and
+            <a href="https://huggingface.co/openai/clip-vit-base-patch32" target="_blank">CLIP</a>
         </div>
     </div>
 
@@ -342,7 +366,16 @@
         const results = document.getElementById('results');
         const predictions = document.getElementById('predictions');
         const topPrediction = document.getElementById('topPrediction');
+        const freshnessTop = document.getElementById('freshnessTop');
         const errorDiv = document.getElementById('error');
+        const freshPredictions = document.getElementById('freshPredictions');
+        const realtime = document.getElementById('realtime');
+        const video = document.getElementById('video');
+        const btnStart = document.getElementById('btnStart');
+        const btnStop = document.getElementById('btnStop');
+        const rtStatus = document.getElementById('rtStatus');
+        let mediaStream = null;
+        let pollTimer = null;
 
         // Click to upload
         uploadArea.addEventListener('click', () => fileInput.click());
@@ -388,11 +421,11 @@
             };
             reader.readAsDataURL(file);
 
-            // Upload and classify
-            classifyImage(file);
+            // Upload and analyze
+            analyzeImage(file);
         }
 
-        async function classifyImage(file) {
+        async function analyzeImage(file) {
             // Hide previous results and errors
             results.classList.remove('active');
             errorDiv.classList.remove('active');
@@ -405,7 +438,7 @@
                 const formData = new FormData();
                 formData.append('file', file);
 
-                const response = await fetch('/classify', {
+                const response = await fetch('/analyze', {
                     method: 'POST',
                     body: formData
                 });
@@ -418,24 +451,34 @@
                 displayResults(data);
             } catch (error) {
                 console.error('Error:', error);
-                showError('Failed to classify image. Please try again.');
+                showError('Failed to analyze image. Please try again.');
             } finally {
                 loading.classList.remove('active');
             }
         }
 
         function displayResults(data) {
-            // Display top prediction
-            const top = data.top_prediction;
+            // Display top vegetable
+            const vegTop = data.vegetable?.top || 'Unknown';
+            const vegConf = data.vegetable?.predictions?.[0]?.confidence ?? 0;
             topPrediction.innerHTML = `
-                <div class="medal">🏆</div>
-                <div class="label">${top.label}</div>
-                <div class="confidence">${top.confidence}% confident</div>
+                <div class="medal">🥇</div>
+                <div class="label">${vegTop}</div>
+                <div class="confidence">${vegConf}% confident</div>
             `;
 
-            // Display all predictions
+            // Display top freshness
+            const frTop = data.freshness?.top || 'Unknown';
+            const frConf = data.freshness?.predictions?.[0]?.confidence ?? 0;
+            freshnessTop.innerHTML = `
+                <div class="medal">🧪</div>
+                <div class="label">${frTop}</div>
+                <div class="confidence">${frConf}% confident</div>
+            `;
+
+            // Display vegetable predictions
             predictions.innerHTML = '';
-            data.predictions.forEach((pred, index) => {
+            (data.vegetable?.predictions || []).forEach((pred, index) => {
                 const item = document.createElement('div');
                 item.className = 'prediction-item';
                 item.style.transform = 'translateX(-20px)';
@@ -460,6 +503,51 @@
                 }, 100 * index);
             });
 
+            // Display freshness predictions
+            freshPredictions.innerHTML = '';
+            (data.freshness?.predictions || []).forEach((pred, index) => {
+                const item = document.createElement('div');
+                item.className = 'prediction-item';
+                item.style.transform = 'translateX(-20px)';
+                const medal = index === 0 ? '🥇' : index === 1 ? '🥈' : index === 2 ? '🥉' : '•';
+                item.innerHTML = `
+                    <div class="prediction-label">
+                        <span class="label-text">${medal} ${pred.label}</span>
+                        <span class="label-confidence">${pred.confidence}%</span>
+                    </div>
+                    <div class="confidence-bar">
+                        <div class="confidence-fill" style="width: 0%"></div>
+                    </div>
+                `;
+                freshPredictions.appendChild(item);
+                setTimeout(() => {
+                    const fill = item.querySelector('.confidence-fill');
+                    fill.style.width = pred.confidence + '%';
+                }, 100 * index);
+            });
+
+            // Details section (if available)
+            if (data.details) {
+                const detailsBox = document.createElement('div');
+                detailsBox.style.background = '#f8f9ff';
+                detailsBox.style.border = '1px solid #e5e7eb';
+                detailsBox.style.borderRadius = '10px';
+                detailsBox.style.padding = '16px';
+                detailsBox.style.marginTop = '16px';
+                detailsBox.innerHTML = `
+                    <div class="results-header" style="margin:0 0 8px 0;">
+                        <span>ℹ️</span>
+                        <span>${data.details.name} Details</span>
+                    </div>
+                    <div style="color:#374151; line-height:1.5;">
+                        <div><strong>Description:</strong> ${data.details.description}</div>
+                        <div style="margin-top:6px;"><strong>Fresh signs:</strong> ${data.details.fresh_signs}</div>
+                        <div style="margin-top:6px;"><strong>Non-fresh signs:</strong> ${data.details.non_fresh_signs}</div>
+                        <div style="margin-top:6px;"><strong>Storage:</strong> ${data.details.storage}</div>
+                    </div>`;
+                results.appendChild(detailsBox);
+            }
+
             results.classList.add('active');
         }
 
@@ -475,6 +563,65 @@
             results.classList.remove('active');
             errorDiv.classList.remove('active');
             uploadArea.style.display = 'block';
+        }
+
+        realtime.style.display = 'block';
+
+        btnStart.addEventListener('click', async () => {
+            try {
+                if (!mediaStream) {
+                    mediaStream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'environment' } });
+                    video.srcObject = mediaStream;
+                }
+                if (pollTimer) clearInterval(pollTimer);
+                pollTimer = setInterval(captureAndAnalyze, 1000);
+                rtStatus.textContent = 'Running';
+            } catch (e) {
+                rtStatus.textContent = 'Webcam not available';
+            }
+        });
+
+        btnStop.addEventListener('click', () => {
+            if (pollTimer) {
+                clearInterval(pollTimer);
+                pollTimer = null;
+            }
+            if (mediaStream) {
+                mediaStream.getTracks().forEach(t => t.stop());
+                mediaStream = null;
+                video.srcObject = null;
+            }
+            rtStatus.textContent = 'Stopped';
+        });
+
+        async function captureAndAnalyze() {
+            if (!video.videoWidth) return;
+            const canvas = document.createElement('canvas');
+            canvas.width = video.videoWidth;
+            canvas.height = video.videoHeight;
+            const ctx = canvas.getContext('2d');
+            ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+            const blob = await new Promise(r => canvas.toBlob(r, 'image/jpeg', 0.7));
+            const formData = new FormData();
+            formData.append('file', blob, 'frame.jpg');
+            try {
+                const res = await fetch('/analyze-top', { method: 'POST', body: formData });
+                if (!res.ok) return;
+                const data = await res.json();
+                const veg = data.vegetable || 'Unknown';
+                const fresh = data.freshness || 'Unknown';
+                topPrediction.innerHTML = `
+                    <div class="medal">🥇</div>
+                    <div class="label">${veg}</div>
+                    <div class="confidence"></div>
+                `;
+                freshnessTop.innerHTML = `
+                    <div class="medal">🧪</div>
+                    <div class="label">${fresh}</div>
+                    <div class="confidence"></div>
+                `;
+                results.classList.add('active');
+            } catch {}
         }
     </script>
 </body>

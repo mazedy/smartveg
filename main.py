@@ -1,6 +1,8 @@
 """
-Image Classification API using Pre-trained MobileNet Model
-Model: google/mobilenet_v2_1.0_224 (optimized for low memory)
+Image Classification API using Pre-trained Models
+
+Adds vegetable analysis with zero-shot classification (CLIP) to determine
+vegetable type and freshness/damage.
 """
 
 from fastapi import FastAPI, File, UploadFile, HTTPException
@@ -29,22 +31,118 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Global variable for the model
+# Global variables for the models
 classifier = None
+zeroshot = None
+
+# Supported vegetable labels (extendable)
+VEGETABLE_LABELS = [
+    "tomato",
+    "potato",
+    "onion",
+    "carrot",
+    "cucumber",
+    "bell pepper",
+    "cabbage",
+    "lettuce",
+    "eggplant",
+    "chili pepper",
+    "broccoli",
+    "cauliflower",
+    "spinach",
+    "ginger",
+    "garlic",
+]
+
+# Simple details database for common vegetables
+VEGETABLE_DETAILS = {
+    "tomato": {
+        "name": "Tomato",
+        "description": "A juicy red fruit used as a vegetable in cooking.",
+        "fresh_signs": "Firm skin, bright color, fragrant smell.",
+        "non_fresh_signs": "Wrinkled skin, soft spots, mold.",
+        "storage": "Room temp until ripe, then refrigerate 2–3 days.",
+    },
+    "potato": {
+        "name": "Potato",
+        "description": "Starchy tuber, staple ingredient.",
+        "fresh_signs": "Firm, dry skin with no green tint.",
+        "non_fresh_signs": "Soft, sprouting, green or moldy spots.",
+        "storage": "Cool, dark, well-ventilated place (not fridge).",
+    },
+    "onion": {
+        "name": "Onion",
+        "description": "Bulb vegetable with pungent flavor.",
+        "fresh_signs": "Dry papery skin, firm bulb.",
+        "non_fresh_signs": "Soft, wet spots, sprouting.",
+        "storage": "Cool, dark, ventilated place (whole).",
+    },
+    "carrot": {
+        "name": "Carrot",
+        "description": "Crunchy root vegetable rich in beta-carotene.",
+        "fresh_signs": "Firm, vibrant orange, no cracks.",
+        "non_fresh_signs": "Limp, black spots, mushy ends.",
+        "storage": "Refrigerate in crisper drawer, bagged.",
+    },
+    "cucumber": {
+        "name": "Cucumber",
+        "description": "Cool, hydrating gourd often eaten fresh.",
+        "fresh_signs": "Firm, glossy skin, no soft spots.",
+        "non_fresh_signs": "Yellowing, soft areas, wrinkles.",
+        "storage": "Refrigerate; use within a week.",
+    },
+    "bell pepper": {
+        "name": "Bell Pepper",
+        "description": "Sweet pepper available in many colors.",
+        "fresh_signs": "Taut skin, firm walls, bright color.",
+        "non_fresh_signs": "Wrinkling, soft patches, dull color.",
+        "storage": "Refrigerate unwashed in crisper.",
+    },
+    "cabbage": {
+        "name": "Cabbage",
+        "description": "Leafy head vegetable, green or purple.",
+        "fresh_signs": "Tight, heavy head, crisp leaves.",
+        "non_fresh_signs": "Loose, wilted leaves, browning.",
+        "storage": "Refrigerate wrapped; lasts 1–2 weeks.",
+    },
+    "lettuce": {
+        "name": "Lettuce",
+        "description": "Tender leafy greens for salads.",
+        "fresh_signs": "Crisp, vibrant leaves.",
+        "non_fresh_signs": "Wilted, slimy, browning edges.",
+        "storage": "Refrigerate with paper towel in container.",
+    },
+    "eggplant": {
+        "name": "Eggplant",
+        "description": "Glossy purple fruit used as a vegetable.",
+        "fresh_signs": "Firm, shiny skin, green cap.",
+        "non_fresh_signs": "Dull, wrinkled skin, soft spots.",
+        "storage": "Cool room or fridge crisper for few days.",
+    },
+    "chili pepper": {
+        "name": "Chili Pepper",
+        "description": "Spicy peppers varying in heat.",
+        "fresh_signs": "Firm, glossy, taut skin.",
+        "non_fresh_signs": "Wrinkled, soft, mold at stem.",
+        "storage": "Refrigerate in breathable bag.",
+    },
+}
 
 @app.on_event("startup")
 async def load_model():
-    """Load the pre-trained model on startup"""
-    global classifier
-    print("🔄 Loading pre-trained model...")
-    print("⏳ This may take 1-2 minutes on first run (downloading model)...")
-    
-    # Use a lighter model that works with 512MB RAM (MobileNet)
-    # This model is smaller (~14MB) and more memory efficient
+    """Load the pre-trained models on startup"""
+    global classifier, zeroshot
+    print("🔄 Loading pre-trained models...")
+    print("⏳ This may take 1-2 minutes on first run (downloading models)...")
+
+    # Lightweight general classifier (MobileNet)
     classifier = pipeline("image-classification", model="google/mobilenet_v2_1.0_224")
-    
-    print("✅ Model loaded successfully!")
-    print("🚀 API is ready to classify images!")
+
+    # Zero-shot image classifier (CLIP) for custom labels like vegetable names and freshness
+    zeroshot = pipeline("zero-shot-image-classification", model="openai/clip-vit-base-patch32")
+
+    print("✅ Models loaded successfully!")
+    print("🚀 API is ready to classify and analyze images!")
 
 
 @app.get("/")
@@ -58,7 +156,7 @@ async def root():
         # Fallback to API info if HTML not found
         return {
             "message": "Image Classification API",
-            "model": "google/mobilenet_v2_1.0_224",
+            "model": "google/mobilenet_v2_1.0_224 + openai/clip-vit-base-patch32",
             "status": "running",
             "endpoints": {
                 "/classify": "POST - Upload an image to classify",
@@ -88,7 +186,9 @@ async def health_check():
     """Health check endpoint"""
     return {
         "status": "healthy",
-        "model_loaded": classifier is not None
+        "classifier_loaded": classifier is not None,
+        "zeroshot_loaded": zeroshot is not None,
+        "vegetable_labels": VEGETABLE_LABELS,
     }
 
 
@@ -142,6 +242,113 @@ async def classify_image(file: UploadFile = File(...)):
             }
         }
     
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error processing image: {str(e)}")
+
+
+def _analyze_image(image: Image.Image):
+    """Helper to analyze vegetable type and freshness using zero-shot classification."""
+    if image.mode != "RGB":
+        image = image.convert("RGB")
+
+    # Vegetable type predictions
+    veg_preds = zeroshot(
+        image,
+        candidate_labels=VEGETABLE_LABELS,
+        hypothesis_template="This is a photo of a {}.",
+        multi_label=False,
+    )
+
+    # Freshness/damage predictions
+    freshness_labels = ["fresh", "non-fresh", "damaged"]
+    fresh_preds = zeroshot(
+        image,
+        candidate_labels=freshness_labels,
+        hypothesis_template="The vegetable is {}.",
+        multi_label=False,
+    )
+
+    # Normalize output format
+    def _fmt(preds):
+        return [
+            {
+                "label": p["label"],
+                "confidence": round(p["score"] * 100, 2),
+                "score": round(p["score"], 4),
+            }
+            for p in preds
+        ]
+
+    veg_top = veg_preds[0]["label"] if isinstance(veg_preds, list) and veg_preds else None
+    fresh_top = fresh_preds[0]["label"] if isinstance(fresh_preds, list) and fresh_preds else None
+
+    details = VEGETABLE_DETAILS.get(veg_top.lower(), None) if veg_top else None
+
+    return {
+        "vegetable": {
+            "top": veg_top,
+            "predictions": _fmt(veg_preds),
+        },
+        "freshness": {
+            "top": fresh_top,
+            "predictions": _fmt(fresh_preds),
+        },
+        "details": details,
+    }
+
+
+@app.post("/analyze")
+async def analyze_image(file: UploadFile = File(...)):
+    """
+    Analyze an uploaded image for vegetable type and freshness/damage using zero-shot classification.
+    Returns top predictions and details for the recognized vegetable.
+    """
+    if zeroshot is None:
+        raise HTTPException(status_code=503, detail="Model not loaded yet. Please wait...")
+
+    if not file.content_type.startswith("image/"):
+        raise HTTPException(status_code=400, detail="File must be an image")
+
+    try:
+        image_bytes = await file.read()
+        image = Image.open(io.BytesIO(image_bytes))
+
+        analysis = _analyze_image(image)
+
+        return {
+            "success": True,
+            "filename": file.filename,
+            **analysis,
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error processing image: {str(e)}")
+
+
+@app.post("/analyze-top")
+async def analyze_image_top_only(file: UploadFile = File(...)):
+    """
+    Fast analysis endpoint that returns only the top vegetable and top freshness label.
+    Useful for real-time webcam polling.
+    """
+    if zeroshot is None:
+        raise HTTPException(status_code=503, detail="Model not loaded yet. Please wait...")
+
+    if not file.content_type.startswith("image/"):
+        raise HTTPException(status_code=400, detail="File must be an image")
+
+    try:
+        image_bytes = await file.read()
+        image = Image.open(io.BytesIO(image_bytes))
+
+        analysis = _analyze_image(image)
+
+        return {
+            "success": True,
+            "filename": file.filename,
+            "vegetable": analysis["vegetable"]["top"],
+            "freshness": analysis["freshness"]["top"],
+            "details": analysis["details"],
+        }
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error processing image: {str(e)}")
 
